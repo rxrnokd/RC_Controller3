@@ -18,12 +18,13 @@
   <div class="map-head"><div><h2>LiDAR · 2D 스캔</h2><small>차량 중심의 실시간 거리 지도</small></div><label>표시 반경 <select id="range"><option value="2">2 m</option><option value="4" selected>4 m</option><option value="8">8 m</option><option value="12">12 m</option></select></label></div>
   <div class="canvas-wrap"><canvas id="map" aria-label="라이다 거리 점군 지도"></canvas></div>
   <div class="map-foot"><span id="lidarStatus">LiDAR 연결 대기</span><span id="pointCount">0 points</span></div>
+  <div id="lidarDetails" class="details" style="white-space:pre-wrap;overflow-wrap:anywhere"></div>
   <div class="hint">전방 0° · 오른쪽 90° · 거리 단위 m. 현재 스캔을 표시하며, 위치 추정이나 SLAM 누적 지도는 포함하지 않습니다.</div>
  </section>
  <div class="stack">
   <section class="card">
    <h2>연결 및 조종</h2>
-   <form id="login" class="row"><input id="token" type="password" aria-label="Pi 터미널 접속 키" placeholder="Pi 터미널에 표시된 접속 키" autocomplete="off" required><button type="submit">연결</button></form>
+   <button id="reconnect">다시 연결</button>
    <p id="error" class="error" role="alert"></p>
    <div id="blockers" class="notice">실제 Pi 서버에 연결하면 센서 상태가 표시됩니다.</div>
    <div id="controlStatus" class="statusline">구동 비활성</div>
@@ -34,10 +35,11 @@
   </section>
   <section class="card">
    <h2>속도 및 출력</h2>
-   <label for="speed" class="row space"><span>주행 목표 RPM</span><b id="speedText">20 RPM</b></label><input id="speed" type="range" min="0" max="80" value="20" step="1">
-   <label for="power" class="row space"><span>DC 모터 출력 상한</span><b id="powerText">35%</b></label><input id="power" type="range" min="0" max="35" value="35" step="1">
-   <label for="steer" class="row space"><span>키보드 최대 조향 명령</span><b id="steerText">10°</b></label><input id="steer" type="range" min="0" max="15" value="10" step="1">
-   <div class="hint">출력 막대는 PI가 사용할 수 있는 PWM 상한입니다. 실제 출력은 아래에 표시됩니다. 막대를 움직이는 것만으로는 주행하지 않습니다.</div>
+   <label for="mode">제어 방식 (구동 해제 후 변경)</label><select id="mode"><option value="pwm">PWM 직접 제어 · 엔코더 없이 주행</option><option value="rpm">RPM PI 제어 · 엔코더 필요</option></select>
+   <label for="speed" class="row space"><span>주행 목표 RPM</span><b id="speedText">20 RPM</b></label><input id="speed" type="range" min="0" max="320" value="20" step="1">
+   <label for="power" class="row space"><span>DC 모터 출력 상한</span><b id="powerText">35%</b></label><input id="power" type="range" min="0" max="100" value="35" step="1">
+   <label for="steer" class="row space"><span>키보드 최대 조향 명령</span><b id="steerText">10°</b></label><input id="steer" type="range" min="0" max="90" value="10" step="1">
+   <div id="modeHint" class="hint">PWM 모드에서는 출력 막대로 구동 출력을 정합니다. RPM 모드에서는 PI 출력 상한입니다. Shift와 방향키를 눌러야 주행합니다.</div>
   </section>
  </div>
  <section class="card bottom">
@@ -61,7 +63,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const client = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2,'0')).join('');
-let token = '', state = null, lease = null, sequence = 0, streamAbort = null, driveBusy = false;
+let state = null, lease = null, sequence = 0, streamAbort = null, driveBusy = false;
 let lastReceived = 0, linked = false, keys = new Set(), limitsSet = false;
 let leaseStarted = 0;
 const fmt = (n, digits=1) => n == null ? '—' : Number(n).toFixed(digits);
@@ -76,13 +78,13 @@ function showError(e){ set('error', e.message || String(e)); }
 async function post(op, extra={}) {
  const abort = new AbortController(); const timer=setTimeout(()=>abort.abort(), 700);
  try {
-  const response=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','X-RC-Token':token},body:JSON.stringify({op,client,seen:state?.monotonic,...extra}),signal:abort.signal,cache:'no-store'});
+  const response=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op,client,seen:state?.monotonic,...extra}),signal:abort.signal,cache:'no-store'});
   const result=await response.json(); if(!response.ok) throw new Error(result.error || '명령 실패'); return result;
  } finally {clearTimeout(timer);}
 }
 function stop(emergency=false) {
  keys.clear(); lease=null;
- if(token) post(emergency?'estop':'stop').catch(showError);
+ post(emergency?'estop':'stop').catch(showError);
 }
 function updateControls(){
  const connected=fresh();
@@ -90,6 +92,7 @@ function updateControls(){
  $('stop').disabled=!connected; $('estop').disabled=!connected;
  $('reset').disabled=!connected || state.armed || state.fatal;
  $('zero').disabled=!connected || state.armed;
+ $('mode').disabled=!connected || state.armed;
 }
 function render(s){
  state=s; lastReceived=performance.now(); linked=true;
@@ -100,16 +103,18 @@ function render(s){
  if(lease && !s.armed && s.monotonic>=leaseStarted) {lease=null; keys.clear();}
  if(!limitsSet){
   $('speed').max=s.limits.max_rpm; $('speed').value=Math.min(20,s.limits.max_rpm);
-  $('power').max=Math.floor(s.limits.max_duty*100); $('power').value=$('power').max;
+  $('power').max=Math.floor(s.limits.max_duty*100); $('power').value=Math.min(35,Number($('power').max));
   $('steer').max=s.limits.max_angle_deg; $('steer').value=Math.min(10,s.limits.max_angle_deg);
   limitsSet=true; sliderText();
  }
+ $('mode').value=s.mode; $('speed').disabled=s.mode==='pwm';
+ set('modeHint',s.mode==='pwm'?'PWM 직접 제어: 출력 막대로 주행 출력을 정합니다. 엔코더 없이도 움직이며 RPM은 보장되지 않습니다.':'RPM PI 제어: 엔코더가 필요하며 출력 막대는 PWM 상한입니다.');
  s.motors.forEach((m,i)=>{
   set(`rpm${i}`,fmt(m.rpm));
   set(`motor${i}`,`PWM ${fmt(m.duty*100)}% · count ${m.count} · A/B ${m.a}/${m.b} · 거리 ${fmt(m.distance_m,3)} m`);
  });
  set('distance',fmt(s.distance_m,3));
- set('distanceNote',s.motors.every(m=>m.calibrated)?'현재 실행 세션 · 휠 엔코더 추정':'보정 전 추정값 · counts/rev 확인 필요');
+ set('distanceNote',s.distance_m==null?'엔코더 미검출 또는 거리 누락 · 추정 불가':s.motors.every(m=>m.calibrated)?'현재 실행 세션 · 휠 엔코더 추정':'보정 전 추정값 · counts/rev 확인 필요');
  set('servoAngle',fmt(s.servo.command_deg));
  set('servoDetails',`PWM ${s.servo.pulse_us} µs · 실제 바퀴 조향각은 미측정`);
  s.ultrasonic.forEach((v,i)=>{set(`us${i}`,fmt(v.distance_m==null?null:v.distance_m*100));set(`usStatus${i}`,`${v.status} · ${v.age_s==null?'—':fmt(v.age_s,2)+'s 전'}`);});
@@ -118,6 +123,7 @@ function render(s){
  set('mtNote',mt.ppr ? `PPR ${mt.ppr} · ${mt.zeroed?'수동 영점':'프로그램 시작 위치'} 기준 · 절대각 아님` : 'PPR 미확인 · config.json의 mt6701.ppr 설정 필요');
  set('mtRaw',`count ${mt.count} · A/B ${mt.a}/${mt.b} · Z 검출 ${mt.z_count}회 · 마지막 Z count ${mt.index_count??'—'} · Z 이후 각도 ${fmt(mt.since_index_deg,2)}°`);
  set('lidarStatus',s.lidar.status+(s.lidar.age_s==null?'':` · ${fmt(s.lidar.age_s,2)}s 전`));
+ set('lidarDetails',`외부 출력: ${s.lidar.fifo} · 수신 ${s.lidar.line_count}줄 / 측정 ${s.lidar.parsed_count}개\n${s.lidar.diagnostics.join('\n')}`);
  set('pointCount',`${s.lidar.points.length} points`);
  set('recording',s.recording.error?'기록 오류: '+s.recording.error:s.recording.enabled?'● Pi에 센서 기록 중':'기록 비활성');
  updateControls(); draw();
@@ -125,13 +131,11 @@ function render(s){
 async function connect(){
  if(streamAbort) streamAbort.abort();
  if(lease) stop();
- token=$('token').value.trim(); $('token').value='';
- if(!token){showError('Pi 터미널의 접속 키를 입력하세요');return;}
  state=null; linked=false; limitsSet=false; lease=null; keys.clear();
  set('error',''); set('connection','연결 중');
  const abort=new AbortController(); streamAbort=abort;
  try{
-  const response=await fetch('/api/events',{headers:{'X-RC-Token':token},signal:abort.signal,cache:'no-store'});
+  const response=await fetch('/api/events',{signal:abort.signal,cache:'no-store'});
   if(!response.ok){const msg=await response.json();throw new Error(msg.error);}
   const reader=response.body.getReader(), decoder=new TextDecoder(); let buffer='';
   while(true){
@@ -156,13 +160,14 @@ async function drive(){
  const forward=keys.has('KeyW') || keys.has('ArrowUp'), backward=keys.has('KeyS') || keys.has('ArrowDown');
  const left=keys.has('KeyA') || keys.has('ArrowLeft'), right=keys.has('KeyD') || keys.has('ArrowRight');
  driveBusy=true; const sentLease=lease;
- try{await post('drive',{lease:sentLease,seq:++sequence,deadman,rpm:(Number(forward)-Number(backward))*Number($('speed').value),steer:(Number(right)-Number(left))*Number($('steer').value),duty_limit:Number($('power').value)/100});}
+ try{await post('drive',{lease:sentLease,seq:++sequence,deadman,rpm:(Number(forward)-Number(backward))*Number($('speed').value),throttle:(Number(forward)-Number(backward))*Number($('power').value)/100,steer:(Number(right)-Number(left))*Number($('steer').value),duty_limit:Number($('power').value)/100});}
  catch(e){if(lease===sentLease){lease=null;keys.clear();showError(e);post('stop').catch(()=>{});}}
  finally{driveBusy=false;}
 }
 function sliderText(){set('speedText',$('speed').value+' RPM');set('powerText',$('power').value+'%');set('steerText',$('steer').value+'°');}
 ['speed','power','steer'].forEach(id=>$(id).addEventListener('input',sliderText));
-$('login').addEventListener('submit',e=>{e.preventDefault();connect();});
+$('reconnect').onclick=connect;
+$('mode').onchange=()=>post('mode',{mode:$('mode').value}).catch(showError);
 $('arm').onclick=async()=>{keys.clear();try{const r=await post('arm');lease=r.lease;leaseStarted=r.armed_at;sequence=0;set('error','');$('arm').blur();drive();}catch(e){showError(e);}};
 $('stop').onclick=()=>stop(); $('estop').onclick=()=>stop(true);
 $('reset').onclick=()=>post('reset').catch(showError); $('zero').onclick=()=>post('zero_mt').catch(showError);
@@ -175,7 +180,7 @@ window.addEventListener('keydown',e=>{
 window.addEventListener('keyup',e=>{if(motionCodes.includes(e.code)){keys.delete(e.code);drive();}});
 window.addEventListener('blur',()=>{if(lease)stop();else keys.clear();});
 document.addEventListener('visibilitychange',()=>{if(document.hidden && lease)stop();});
-window.addEventListener('pagehide',()=>{keys.clear();lease=null;if(token)fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','X-RC-Token':token},body:JSON.stringify({op:'stop'}),keepalive:true}).catch(()=>{});});
+window.addEventListener('pagehide',()=>{keys.clear();if(lease)fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'stop'}),keepalive:true}).catch(()=>{});});
 setInterval(()=>{
  if(linked && performance.now()-lastReceived>500){linked=false;stop();set('connection','데이터 지연 · 구동 해제');$('connection').style.color='var(--red)';updateControls();draw();}
  drive();
@@ -196,6 +201,7 @@ function draw(){
  if(!fresh() || !state.lidar.points.length){ctx.fillStyle='#a6b9cc';ctx.font='14px system-ui';ctx.textAlign='center';ctx.fillText(fresh()?'유효한 LiDAR 스캔을 기다리고 있습니다':'실제 센서 연결 대기',cx,cy+45);ctx.textAlign='left';}
 }
 $('range').onchange=draw; new ResizeObserver(draw).observe(canvas.parentElement); draw();
+connect();
 </script>
 </body>
 </html>

@@ -57,7 +57,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_servo_mechanical_limit(self):
         c = config()
-        c["servo"]["max_angle_deg"] = 90
+        c["servo"]["max_angle_deg"] = 91
         with self.assertRaises(ValueError):
             rc.validate_config(c)
 
@@ -109,6 +109,15 @@ class PITests(unittest.TestCase):
 
 
 class LidarTests(unittest.TestCase):
+    def test_external_fragmented_output_and_disconnect(self):
+        lidar = rc.Lidar(config()["lidar"], threading.Event())
+        lidar.feed(b"theta: 0 Dist: 10")
+        lidar.feed(b"00 Q: 20\r\ntheta: 350 Dist: 2000 Q: 20\ntheta: 0 Dist: 1000 Q: 20\n")
+        self.assertEqual(len(lidar.snapshot()["points"]), 2)
+        self.assertEqual(lidar.snapshot()["parsed_count"], 3)
+        lidar.disconnected()
+        self.assertEqual(lidar.snapshot()["points"], [])
+        self.assertEqual(lidar.buffer, b"")
     def test_sdk_output_units(self):
         self.assertEqual(rc.parse_lidar_line("S  theta: 035.25 Dist: 00123.50 Q: 47 \n"), (True, 35.25, .1235, 47))
 
@@ -139,8 +148,38 @@ class LidarTests(unittest.TestCase):
 
 
 class ControlTests(unittest.TestCase):
+    def test_pwm_runs_without_encoder_and_still_times_out(self):
+        self.control.mode = "pwm"
+        for m in self.c["motors"]:
+            m["encoder_confirmed"] = False
+        self.arm()
+        for i in range(1, 201):
+            self.now.return_value = 100 + i * .02
+            self.cmd("drive", lease=self.lease, seq=i, throttle=.5, steer=0,
+                     duty_limit=1, deadman=True)
+            self.control.step(self.now.return_value, .02)
+        self.assertTrue(self.control.armed)
+        self.assertAlmostEqual(self.hw.outputs[0], .5)
+        self.assertIsNone(self.control.snapshot()["motors"][0]["rpm"])
+        self.assertIsNone(self.control.snapshot()["distance_m"])
+        self.control.step(105, .02)
+        self.assertFalse(self.control.armed)
+        self.assertEqual(self.hw.outputs, [0, 0])
+
+    def test_mode_change_requires_disarm_and_rpm_calibration(self):
+        self.control.mode = "pwm"
+        self.arm()
+        with self.assertRaises(ValueError):
+            self.cmd("mode", mode="rpm")
+        self.cmd("stop")
+        self.c["motors"][0]["encoder_confirmed"] = False
+        self.cmd("mode", mode="rpm")
+        with self.assertRaises(ValueError):
+            self.arm()
+
     def setUp(self):
         self.c = config()
+        self.c["control"]["mode"] = "rpm"
         self.c["hardware_confirmed"] = self.c["servo"]["calibrated"] = True
         for m in self.c["motors"]:
             m["encoder_confirmed"] = True
@@ -216,7 +255,7 @@ class ControlTests(unittest.TestCase):
     def test_stale_and_nonfinite_and_duplicate_commands(self):
         self.arm()
         self.drive()
-        for extra in ({"seen": 99}, {"rpm": math.nan}, {"rpm": math.inf}, {"seq": 1}, {"deadman": "false"}, {"duty_limit": 1}):
+        for extra in ({"seen": 99}, {"rpm": math.nan}, {"rpm": math.inf}, {"seq": 1}, {"deadman": "false"}, {"duty_limit": 1.1}):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.drive(**extra)
 
@@ -318,7 +357,7 @@ class HttpTests(unittest.TestCase):
             def snapshot(self):
                 return {"source": "protocol-test", "armed": False}
         self.fixture = Fixture()
-        self.server = rc.Server(("127.0.0.1", 0), self.fixture, "test-access-key")
+        self.server = rc.Server(("127.0.0.1", 0), self.fixture)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -341,7 +380,7 @@ class HttpTests(unittest.TestCase):
         return result
 
     def test_auth_and_origin(self):
-        self.assertEqual(self.request("GET", "/api/state", auth=False)[0], 401)
+        self.assertEqual(self.request("GET", "/api/state", auth=False)[0], 200)
         self.assertEqual(self.request("GET", "/api/state")[0], 200)
         self.assertEqual(self.request("POST", "/api/command", {"op": "stop"}, extra={"Origin": "http://evil.invalid"})[0], 403)
 

@@ -2,10 +2,12 @@
   "server": {"host": "0.0.0.0", "port": 8080},
   "hardware_confirmed": false,
   "control": {
+    "mode": "pwm",
     "hz": 50,
     "command_timeout_s": 0.4,
-    "max_rpm": 80,
-    "max_duty": 0.35,
+    "max_rpm": 320,
+    "max_duty": 1.0,
+    "ramp_pwm_s": 0.5,
     "ramp_rpm_s": 80,
     "kp": 0.003,
     "ki": 0.006,
@@ -17,7 +19,7 @@
     {"name": "후륜 M1", "pwm_a": 16, "pwm_b": 20, "encoder_a": 4, "encoder_b": 14, "encoder_counts_per_rev": 1320, "encoder_confirmed": false, "motor_sign": 1, "encoder_sign": 1, "wheel_diameter_mm": 75, "wheel_ratio": 1},
     {"name": "후륜 M2", "pwm_a": 21, "pwm_b": 26, "encoder_a": 15, "encoder_b": 18, "encoder_counts_per_rev": 1320, "encoder_confirmed": false, "motor_sign": 1, "encoder_sign": 1, "wheel_diameter_mm": 75, "wheel_ratio": 1}
   ],
-  "servo": {"gpio": 13, "calibrated": false, "center_us": 1500, "min_us": 1300, "max_us": 1700, "us_per_degree": 11.111111, "max_angle_deg": 15, "rate_deg_s": 60, "sign": 1},
+  "servo": {"gpio": 13, "calibrated": false, "center_us": 1500, "min_us": 500, "max_us": 2500, "us_per_degree": 11.111111, "max_angle_deg": 90, "rate_deg_s": 60, "sign": 1},
   "mt6701": {"a": 19, "b": 10, "z": 9, "ppr": null, "sign": 1, "glitch_us": 0},
   "ultrasonic": {
     "model": "US-100",
@@ -36,10 +38,8 @@
     ]
   },
   "lidar": {
-    "enabled": false,
-    "executable": "/home/pi/rplidar_sdk/output/Linux/Release/ultra_simple",
-    "port": "/dev/ttyUSB0",
-    "baud": 460800,
+    "enabled": true,
+    "fifo": "/tmp/rc_controller_lidar.fifo",
     "min_m": 0.05,
     "max_m": 12,
     "min_quality": 1,

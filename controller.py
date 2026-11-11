@@ -14,10 +14,10 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
+import select
 import signal
 import socket
-import subprocess
+import stat
 import sys
 import threading
 import time
@@ -54,10 +54,14 @@ def validate_config(c):
     if type(c["server"]["port"]) is not int or not isinstance(c["server"]["host"], str):
         raise ValueError("서버 host/port 형식 오류")
     ctrl = c["control"]
-    bounds = {"hz": (20, 100), "command_timeout_s": (.2, .5), "max_rpm": (1, 280),
+    ctrl.setdefault("mode", "pwm")
+    ctrl.setdefault("ramp_pwm_s", .5)
+    if ctrl["mode"] not in ("pwm", "rpm"):
+        raise ValueError("control.mode는 pwm 또는 rpm입니다")
+    bounds = {"hz": (20, 100), "command_timeout_s": (.2, .5), "max_rpm": (1, 320),
               "max_duty": (.01, 1), "ramp_rpm_s": (1, 400), "kp": (0, .1),
               "ki": (0, .2), "rpm_filter_s": (.02, .5), "stall_timeout_s": (.2, 2),
-              "reversal_pause_s": (.2, 2)}
+              "reversal_pause_s": (.2, 2), "ramp_pwm_s": (.05, 2)}
     for key, bounds_ in bounds.items():
         number(ctrl[key], *bounds_, key)
     if len(c["motors"]) != 2:
@@ -112,15 +116,14 @@ def validate_config(c):
         raise ValueError("중복 GPIO가 있습니다")
     l = c["lidar"]
     boolean(l["enabled"])
-    number(l["baud"], 9600, 2000000)
+    l.setdefault("fifo", "/tmp/rc_controller_lidar.fifo")
     number(l["min_m"], .01, 1)
     number(l["max_m"], l["min_m"], 12)
     number(l["min_quality"], 0, 255)
     number(l["angle_offset_deg"], -360, 360)
     number(l["stale_s"], .3, 5)
-    for key in ("executable", "port"):
-        if not isinstance(l[key], str) or not l[key]:
-            raise ValueError("LiDAR 경로 설정 오류")
+    if not isinstance(l["fifo"], str) or not l["fifo"].startswith("/") or "\x00" in l["fifo"]:
+        raise ValueError("LiDAR fifo는 /tmp/... 형태의 Linux 절대 경로입니다")
     r = c["recording"]
     boolean(r["enabled"])
     boolean(r["include_lidar"])
@@ -400,15 +403,18 @@ def parse_lidar_line(line):
 class Lidar:
     def __init__(self, c, stop_event):
         self.c, self.stop_event, self.lock = c, stop_event, threading.Lock()
-        self.process = None
         self.points, self.pending = [], {}
+        self.buffer = b""
+        self.line_count = self.parsed_count = 0
         self.last_angle = None
         self.updated = None
         self.scan_id = 0
-        self.status = "대기" if c["enabled"] else "비활성: SDK 경로 설정 후 활성화"
+        self.status = "FIFO 준비 중" if c["enabled"] else "비활성: lidar.enabled=true 필요"
         self.diagnostics = deque(maxlen=4)
 
     def consume(self, line):
+        with self.lock:
+            self.line_count += 1
         parsed = parse_lidar_line(line)
         if parsed is None:
             if line.strip():
@@ -420,6 +426,7 @@ class Lidar:
         # use the sorted angle wrap to avoid splitting one rotation twice.
         boundary = self.last_angle is not None and angle + 180 < self.last_angle
         with self.lock:
+            self.parsed_count += 1
             if boundary:
                 self.points = list(self.pending.values())
                 self.pending.clear()
@@ -431,59 +438,97 @@ class Lidar:
                 a = (angle + self.c["angle_offset_deg"]) % 360
                 self.pending[int(a * 2) % 720] = [round(a, 2), round(distance, 4), quality]
 
+    def feed(self, chunk):
+        """Handle partial/multiple lines from a nonblocking external stdout pipe."""
+        self.buffer += chunk
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            if len(line) <= 4096:
+                self.consume(line.decode("utf-8", errors="replace").rstrip("\r"))
+        if len(self.buffer) > 4096:
+            self.buffer = b""
+            with self.lock:
+                self.diagnostics.append("4096바이트 초과 줄 무시: ultra_simple 텍스트 출력인지 확인")
+
+    def disconnected(self):
+        self.buffer = b""
+        with self.lock:
+            self.pending.clear()
+            self.points = []
+            self.last_angle = self.updated = None
+            self.status = "외부 SDK 출력 대기: 두 번째 터미널에서 실행하세요"
+
+    def open_fifo(self):
+        path = Path(self.c.get("fifo", "/tmp/rc_controller_lidar.fifo"))
+        if not hasattr(os, "mkfifo"):
+            raise RuntimeError("LiDAR FIFO 수집은 Pi Linux에서 실행해야 합니다")
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            pass
+        info = path.lstat()
+        if not stat.S_ISFIFO(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"본인 소유의 FIFO가 아닙니다: {path}. 일반 파일/링크는 읽지 않습니다")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(fd)
+        if not stat.S_ISFIFO(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            os.close(fd)
+            raise RuntimeError("FIFO 경로가 열기 중 변경되었습니다")
+        return fd
+
     def run(self):
         if not self.c["enabled"]:
             return
+        fd = None
         try:
-            exe = Path(self.c["executable"]).expanduser()
-            if not exe.is_absolute() or not exe.is_file() or not os.access(exe, os.X_OK):
-                raise RuntimeError("실행 가능한 ultra_simple의 절대 경로를 설정하세요")
-            stdbuf = shutil.which("stdbuf")
-            if not stdbuf:
-                raise RuntimeError("stdbuf가 필요합니다: sudo apt install coreutils")
-            cmd = [stdbuf, "-oL", "-eL", str(exe), "--channel", "--serial", self.c["port"], str(self.c["baud"])]
-            with self.lock:
-                if self.stop_event.is_set():
-                    return
-                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                                                start_new_session=True)
-            with self.process.stdout:
-                for line in iter(lambda: self.process.stdout.readline(4096), ""):
-                    if self.stop_event.is_set():
-                        break
-                    self.consume(line)
-            if not self.stop_event.is_set():
-                raise RuntimeError(f"ultra_simple 종료 (code={self.process.poll()})")
+            fd = self.open_fifo()
+            self.disconnected()
+            logging.info("LiDAR 외부 출력 수신 준비: %s", self.c.get("fifo", "/tmp/rc_controller_lidar.fifo"))
+            had_data = False
+            last_data = time.monotonic()
+            while not self.stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], .2)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    if had_data:
+                        self.disconnected()
+                    had_data = False
+                    self.stop_event.wait(.1)
+                    continue
+                now = time.monotonic()
+                if now - last_data > self.c["stale_s"]:
+                    self.disconnected()
+                last_data, had_data = now, True
+                self.feed(chunk)
         except Exception as exc:
             with self.lock:
                 self.status = f"오류: {exc}"
                 self.points = []
             logging.error("LiDAR: %s", exc)
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def snapshot(self):
         with self.lock:
             age = None if self.updated is None else time.monotonic() - self.updated
             stale = age is None or age > self.c["stale_s"]
             status = self.status
-            if stale and status in ("정상", "대기", "유효 거리 없음"):
+            if stale and status in ("정상", "유효 거리 없음"):
                 status = "데이터 수신 대기/지연"
             return {"points": [] if stale else self.points.copy(), "status": status,
                     "age_s": None if age is None else round(age, 3), "scan_id": self.scan_id,
-                    "diagnostics": list(self.diagnostics)}
+                    "diagnostics": list(self.diagnostics), "fifo": self.c.get("fifo", "/tmp/rc_controller_lidar.fifo"),
+                    "line_count": self.line_count, "parsed_count": self.parsed_count}
 
     def close(self):
-        with self.lock:
-            p = self.process
-        if p and p.poll() is None:
-            for sig, timeout in ((signal.SIGINT, 2), (signal.SIGTERM, 1), (signal.SIGKILL, 1)):
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(p.pid, sig)
-                try:
-                    p.wait(timeout)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
+        # The SDK is owned by the user's terminal. Never launch or kill it here.
+        self.stop_event.set()
 
 
 class Controller:
@@ -498,6 +543,9 @@ class Controller:
         self.last_command = 0.0
         self.requested = self.target = self.steering = self.steer_target = 0.0
         self.duty_limit = c["control"]["max_duty"]
+        self.mode = c["control"].get("mode", "pwm")
+        self.distance_incomplete = [False, False]
+        self.no_feedback_since = [None, None]
         self.servo_us = 0
         self.last_direction = 0
         self.reverse_until = 0.0
@@ -508,13 +556,17 @@ class Controller:
         self.stall_since = [None, None]
         self.wrong_since = [None, None]
         self.pi = [PI(c["control"]["kp"], c["control"]["ki"]) for _ in range(2)]
-        self.blockers = []
-        if not c["hardware_confirmed"]:
-            self.blockers.append("전원·3.3V 신호·배선 확인 후 hardware_confirmed=true")
-        if not all(m["encoder_confirmed"] for m in c["motors"]):
-            self.blockers.append("모터 x4 counts/rev 확인 후 encoder_confirmed=true")
-        if not c["servo"]["calibrated"]:
-            self.blockers.append("서보 중립/기구 범위 확인 후 calibrated=true")
+
+    @property
+    def blockers(self):
+        result = []
+        if not self.c["hardware_confirmed"]:
+            result.append("전원·3.3V 신호·배선 확인 후 hardware_confirmed=true")
+        if self.mode == "rpm" and not all(m["encoder_confirmed"] for m in self.c["motors"]):
+            result.append("RPM 모드는 encoder_confirmed=true 필요. 엔코더 없이 주행하려면 PWM 선택")
+        if not self.c["servo"]["calibrated"]:
+            result.append("서보 중립/기구 범위 확인 후 calibrated=true")
+        return result
 
     def disarm(self, reason, emergency=False):
         with self.lock:
@@ -546,6 +598,16 @@ class Controller:
                     raise ValueError("구동 중이거나 하드웨어 오류입니다. 정지/프로그램 재시작 필요")
                 self.estop = False
                 self.reason = "정지 잠금 해제: 재활성화 필요"
+            elif op == "mode":
+                if self.armed:
+                    raise ValueError("모드 변경 전 구동을 해제하세요")
+                if data.get("mode") not in ("rpm", "pwm"):
+                    raise ValueError("모드는 pwm 또는 rpm입니다")
+                self.mode = data["mode"]
+                self.requested = self.target = 0.0
+                for pi in self.pi:
+                    pi.reset()
+                self.reason = "PWM 직접 제어 선택" if self.mode == "pwm" else "RPM PI 제어 선택"
             elif op == "zero_mt":
                 if self.armed:
                     raise ValueError("MT 영점은 구동 비활성 상태에서 설정하세요")
@@ -553,7 +615,7 @@ class Controller:
             elif op == "arm":
                 if self.blockers or self.estop or self.fatal or self.armed:
                     raise ValueError("활성화 불가: " + "; ".join(self.blockers or [self.reason]))
-                if max(abs(r) for r in self.rpms) > 5:
+                if self.mode == "rpm" and max(abs(r) for r in self.rpms) > 5:
                     raise ValueError("바퀴가 정지한 후 활성화하세요")
                 self.owner, self.lease = client, secrets.token_urlsafe(18)
                 self.seq, self.last_command = -1, now
@@ -562,6 +624,7 @@ class Controller:
                 self.last_direction = 0
                 self.stall_since = [None, None]
                 self.wrong_since = [None, None]
+                self.no_feedback_since = [None, None]
                 return {"ok": True, "lease": self.lease, "armed_at": now}
             elif op == "drive":
                 if not self.armed or client != self.owner or data.get("lease") != self.lease:
@@ -572,12 +635,15 @@ class Controller:
                 seq = data.get("seq")
                 if type(seq) is not int or seq <= self.seq:
                     raise ValueError("중복/역순 명령")
-                rpm = number(data.get("rpm"), -self.c["control"]["max_rpm"], self.c["control"]["max_rpm"], "rpm")
+                if self.mode == "rpm":
+                    requested = number(data.get("rpm"), -self.c["control"]["max_rpm"], self.c["control"]["max_rpm"], "rpm")
+                else:
+                    requested = number(data.get("throttle"), -1, 1, "throttle")
                 steer = number(data.get("steer"), -self.c["servo"]["max_angle_deg"], self.c["servo"]["max_angle_deg"], "steer")
                 duty = number(data.get("duty_limit"), 0, self.c["control"]["max_duty"], "duty_limit")
                 if type(data.get("deadman")) is not bool:
                     raise ValueError("deadman은 boolean이어야 합니다")
-                self.requested = rpm if data["deadman"] else 0.0
+                self.requested = requested if data["deadman"] else 0.0
                 self.steer_target = steer if data["deadman"] else 0.0
                 self.duty_limit, self.seq, self.last_command = duty, seq, now
             else:
@@ -607,7 +673,8 @@ class Controller:
             if reversing:
                 if not self.reverse_until:
                     self.reverse_until = now + ctrl["reversal_pause_s"]
-                if now >= self.reverse_until and self.still_since and now - self.still_since >= .15:
+                stopped = self.mode == "pwm" or (self.still_since and now - self.still_since >= .15)
+                if now >= self.reverse_until and stopped:
                     self.last_direction = direction
                     self.reverse_until = 0
                     reversing = False
@@ -617,21 +684,30 @@ class Controller:
                 self.target = 0.0
             else:
                 self.last_direction = direction
-                self.target = approach(self.target, self.requested, ctrl["ramp_rpm_s"] * dt)
+                rate = ctrl.get("ramp_pwm_s", .5) if self.mode == "pwm" else ctrl["ramp_rpm_s"]
+                self.target = approach(self.target, self.requested, rate * dt)
             for i, q in enumerate(self.hw.encoders):
-                duty = self.pi[i].update(self.target, self.rpms[i], dt, self.duty_limit)
+                if self.mode == "pwm":
+                    self.pi[i].reset()
+                    duty = clamp(self.target, -self.duty_limit, self.duty_limit)
+                else:
+                    duty = self.pi[i].update(self.target, self.rpms[i], dt, self.duty_limit)
+                no_feedback = abs(duty) > .01 and now - q.snapshot()["last_edge"] > ctrl["stall_timeout_s"]
+                self.no_feedback_since[i] = (self.no_feedback_since[i] or now) if no_feedback else None
+                if self.no_feedback_since[i] is not None and now - self.no_feedback_since[i] > ctrl["stall_timeout_s"]:
+                    self.distance_incomplete[i] = True
                 pushing = abs(duty) > .1 and abs(self.target) > 5
                 no_motion = pushing and abs(self.rpms[i]) < 2
                 wrong = pushing and self.rpms[i] * self.target < -10
                 self.stall_since[i] = (self.stall_since[i] or now) if no_motion else None
                 self.wrong_since[i] = (self.wrong_since[i] or now) if wrong else None
-                if self.stall_since[i] is not None and now - self.stall_since[i] > ctrl["stall_timeout_s"]:
+                if self.mode == "rpm" and self.stall_since[i] is not None and now - self.stall_since[i] > ctrl["stall_timeout_s"]:
                     self.disarm(f"M{i+1}: 엔코더 무응답/모터 정지", True)
                     return
-                if self.wrong_since[i] is not None and now - self.wrong_since[i] > .2:
+                if self.mode == "rpm" and self.wrong_since[i] is not None and now - self.wrong_since[i] > .2:
                     self.disarm(f"M{i+1}: 엔코더/구동 방향 불일치", True)
                     return
-                if abs(self.rpms[i]) > max(100, ctrl["max_rpm"] * 1.5):
+                if self.mode == "rpm" and abs(self.rpms[i]) > max(100, ctrl["max_rpm"] * 1.5):
                     self.disarm(f"M{i+1}: 과속/엔코더 이상", True)
                     return
                 self.hw.motor(i, duty)
@@ -663,9 +739,14 @@ class Controller:
             for i, (m, q) in enumerate(zip(self.c["motors"], self.hw.encoders)):
                 e = q.snapshot()
                 metres = math.pi * m["wheel_diameter_mm"] / 1000 / m["encoder_counts_per_rev"] / m["wheel_ratio"]
-                motors.append({**e, "name": m["name"], "rpm": round(self.rpms[i], 2),
-                               "duty": round(self.duties[i], 4), "distance_m": round(e["travel_counts"] * metres, 4),
+                feedback = e["travel_counts"] > 0 and not (abs(self.duties[i]) > .01 and time.monotonic() - e["last_edge"] > self.c["control"]["stall_timeout_s"])
+                distance_valid = e["travel_counts"] > 0 and not self.distance_incomplete[i]
+                motors.append({**e, "name": m["name"], "rpm": round(self.rpms[i], 2) if feedback else None,
+                               "duty": round(self.duties[i], 4),
+                               "distance_m": round(e["travel_counts"] * metres, 4) if distance_valid else None,
+                               "encoder_distance_m": round(e["travel_counts"] * metres, 4),
                                "signed_distance_m": round(e["count"] * metres, 4),
+                               "feedback_present": feedback, "distance_incomplete": self.distance_incomplete[i],
                                "calibrated": m["encoder_confirmed"]})
             mt = self.hw.mt.snapshot()
             ppr = self.c["mt6701"]["ppr"]
@@ -675,8 +756,11 @@ class Controller:
             return {"monotonic": time.monotonic(), "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "armed": self.armed, "estop": self.estop, "fatal": self.fatal, "reason": self.reason,
                     "owner": self.owner, "blockers": self.blockers, "motors": motors,
-                    "target_rpm": round(self.target, 2), "requested_rpm": self.requested,
-                    "distance_m": round(sum(m["distance_m"] for m in motors) / 2, 4),
+                    "mode": self.mode,
+                    "target_rpm": round(self.target, 2) if self.mode == "rpm" else None,
+                    "requested_rpm": self.requested if self.mode == "rpm" else None,
+                    "target_pwm": round(self.target, 4) if self.mode == "pwm" else None,
+                    "distance_m": round(sum(m["distance_m"] for m in motors) / 2, 4) if all(m["distance_m"] is not None for m in motors) else None,
                     "servo": {"command_deg": round(self.steering, 2) if self.servo_us else None,
                               "pulse_us": self.servo_us, "measured_deg": None}, "mt6701": mt,
                     "limits": {"max_rpm": self.c["control"]["max_rpm"], "max_duty": self.c["control"]["max_duty"],
@@ -753,8 +837,8 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, runtime, token):
-        self.runtime, self.token = runtime, token
+    def __init__(self, address, runtime):
+        self.runtime = runtime
         self.slots = threading.BoundedSemaphore(12)
         self.streams = threading.BoundedSemaphore(4)
         super().__init__(address, Handler)
@@ -801,11 +885,7 @@ class Handler(BaseHTTPRequestHandler):
         self.headers_for(status, "application/json; charset=utf-8", len(body))
         self.wfile.write(body)
 
-    def authenticated(self):
-        token = self.headers.get("X-RC-Token", "")
-        if not secrets.compare_digest(token.encode(), self.server.token.encode()):
-            self.reply(401, {"error": "접속 키를 확인하세요"})
-            return False
+    def same_origin(self):
         origin = self.headers.get("Origin")
         if origin and origin != "http://" + self.headers.get("Host", ""):
             self.reply(403, {"error": "다른 웹사이트에서 보낸 요청은 허용하지 않습니다"})
@@ -818,7 +898,7 @@ class Handler(BaseHTTPRequestHandler):
             body = (ROOT / "index.html").read_bytes()
             self.headers_for(200, "text/html; charset=utf-8", len(body))
             self.wfile.write(body)
-        elif route in ("/api/state", "/api/events") and self.authenticated():
+        elif route in ("/api/state", "/api/events") and self.same_origin():
             if route == "/api/state":
                 self.reply(200, self.server.runtime.snapshot())
                 return
@@ -843,7 +923,7 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path != "/api/command":
             self.reply(404, {"error": "Not found"})
             return
-        if not self.authenticated():
+        if not self.same_origin():
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -883,9 +963,6 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("이 폴더의 제어 프로그램이 이미 실행 중입니다") from None
-        token = os.environ.get("RC_TOKEN") or secrets.token_urlsafe(18)
-        if len(token) < 12:
-            raise ValueError("RC_TOKEN은 12자 이상으로 지정하세요")
         runtime = Runtime(c)
         server = None
         def shutdown_signal(*_):
@@ -893,10 +970,10 @@ def main():
         signal.signal(signal.SIGTERM, shutdown_signal)
         signal.signal(signal.SIGINT, shutdown_signal)
         try:
-            server = Server((c["server"]["host"], c["server"]["port"]), runtime, token)
+            server = Server((c["server"]["host"], c["server"]["port"]), runtime)
             server.timeout = .2
             runtime.start()
-            print(f"\n브라우저: http://<Pi IP>:{c['server']['port']}\n접속 키: {token}\nCtrl+C로 종료\n", flush=True)
+            print(f"\n브라우저: http://<Pi IP>:{c['server']['port']} (접속 키 없음)\nLiDAR는 별도 터미널에서 실행하여 {c['lidar']['fifo']}로 출력하세요.\nCtrl+C로 종료\n", flush=True)
             while not runtime.stop_event.is_set():
                 server.handle_request()
         finally:
