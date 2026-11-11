@@ -204,7 +204,7 @@ class Hardware:
         self.c, self.callbacks, self.script = c, [], None
         self.heartbeat = 0
         self.watchdog_check = 0.0
-        self.pi = pigpio.pi("127.0.0.1")
+        self.pi = pigpio.pi()
         if not self.pi.connected:
             raise RuntimeError("pigpiod에 연결하지 못했습니다. README의 시작 명령을 확인하세요")
         # Avoid a wedged daemon blocking cleanup/control indefinitely.
