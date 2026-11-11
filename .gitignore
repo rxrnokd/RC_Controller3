@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+logs/
+tmp/
+.tools/
+.rc_controller.lock
+*.pdf
+*.png
+*.txt

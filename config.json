@@ -1,0 +1,50 @@
+{
+  "server": {"host": "0.0.0.0", "port": 8080},
+  "hardware_confirmed": false,
+  "control": {
+    "hz": 50,
+    "command_timeout_s": 0.4,
+    "max_rpm": 80,
+    "max_duty": 0.35,
+    "ramp_rpm_s": 80,
+    "kp": 0.003,
+    "ki": 0.006,
+    "rpm_filter_s": 0.12,
+    "stall_timeout_s": 0.7,
+    "reversal_pause_s": 0.3
+  },
+  "motors": [
+    {"name": "후륜 M1", "pwm_a": 16, "pwm_b": 20, "encoder_a": 4, "encoder_b": 14, "encoder_counts_per_rev": 1320, "encoder_confirmed": false, "motor_sign": 1, "encoder_sign": 1, "wheel_diameter_mm": 75, "wheel_ratio": 1},
+    {"name": "후륜 M2", "pwm_a": 21, "pwm_b": 26, "encoder_a": 15, "encoder_b": 18, "encoder_counts_per_rev": 1320, "encoder_confirmed": false, "motor_sign": 1, "encoder_sign": 1, "wheel_diameter_mm": 75, "wheel_ratio": 1}
+  ],
+  "servo": {"gpio": 13, "calibrated": false, "center_us": 1500, "min_us": 1300, "max_us": 1700, "us_per_degree": 11.111111, "max_angle_deg": 15, "rate_deg_s": 60, "sign": 1},
+  "mt6701": {"a": 19, "b": 10, "z": 9, "ppr": null, "sign": 1, "glitch_us": 0},
+  "ultrasonic": {
+    "model": "US-100",
+    "enabled": true,
+    "trigger_us": 10,
+    "slot_s": 0.065,
+    "timeout_s": 0.03,
+    "speed_of_sound_m_s": 343,
+    "min_m": 0.02,
+    "max_m": 4.0,
+    "sensors": [
+      {"name": "초음파 1", "trig": 17, "echo": 27},
+      {"name": "초음파 2", "trig": 22, "echo": 23},
+      {"name": "초음파 3", "trig": 24, "echo": 25},
+      {"name": "초음파 4", "trig": 5, "echo": 6}
+    ]
+  },
+  "lidar": {
+    "enabled": false,
+    "executable": "/home/pi/rplidar_sdk/output/Linux/Release/ultra_simple",
+    "port": "/dev/ttyUSB0",
+    "baud": 460800,
+    "min_m": 0.05,
+    "max_m": 12,
+    "min_quality": 1,
+    "angle_offset_deg": 0,
+    "stale_s": 1.0
+  },
+  "recording": {"enabled": true, "hz": 2, "include_lidar": true, "max_bytes": 10000000, "backup_count": 3}
+}

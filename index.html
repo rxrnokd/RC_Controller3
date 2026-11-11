@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RC Controller · Raspberry Pi 4</title>
+<style>
+:root{color-scheme:dark;--bg:#0b111b;--card:#121d2b;--line:#28384b;--ink:#e7eff7;--muted:#94a8bd;--cyan:#4bd5ce;--red:#ff747b;--amber:#edc26d}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}header{padding:22px 28px 14px;display:flex;align-items:center;justify-content:space-between;gap:15px}h1{font-size:24px;margin:0 0 5px}h2{font-size:16px;margin:0 0 16px}.sub,small{color:var(--muted)}.badge{border:1px solid var(--line);border-radius:20px;padding:7px 14px;font-size:13px;color:var(--amber)}main{padding:0 28px 28px;display:grid;grid-template-columns:minmax(0,1fr) 350px;gap:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}.map{grid-row:span 2;display:flex;flex-direction:column;min-height:680px}.map-head{display:flex;justify-content:space-between;gap:10px;align-items:start}.map-head h2{margin-bottom:5px}.canvas-wrap{flex:1;min-height:480px;position:relative;margin:16px -4px 0}canvas{width:100%;height:100%;position:absolute;inset:0}.map-foot{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px;margin-top:14px}.stack{display:grid;gap:18px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.space{justify-content:space-between}.value{font-size:27px;font-variant-numeric:tabular-nums;font-weight:650}.unit{font-size:12px;color:var(--muted)}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:14px}.metric{background:#0c1521;padding:13px;border-radius:9px}.metric small{display:block;margin-bottom:6px}.wide{grid-column:1/-1}button,input,select{font:inherit}button{border:1px solid #39506a;border-radius:7px;background:#22374d;color:var(--ink);padding:9px 12px;cursor:pointer}button:hover{background:#2b4762}button:disabled{opacity:.4;cursor:not-allowed}button.primary{background:#20665f;border-color:#318c82}.danger{background:#8a303d;border-color:#b94f5d;width:100%;font-weight:700;font-size:17px;margin-top:12px;padding:13px}.danger:hover{background:#a33a4b}input[type=password]{min-width:0;flex:1;background:#0b1522;color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:10px}input[type=range]{width:100%;accent-color:var(--cyan);margin:12px 0 17px}select{background:#16283b;color:var(--ink);padding:6px;border-radius:6px;border:1px solid var(--line)}label{font-size:13px;display:block}.hint{font-size:12px;color:var(--muted);line-height:1.7;margin:12px 0 0}.notice{background:#2a241a;border:1px solid #5e4b2d;color:var(--amber);padding:12px 14px;border-radius:9px;font-size:13px;line-height:1.6;margin-bottom:15px;white-space:pre-line}.error{color:var(--red);min-height:20px;font-size:13px;margin-top:10px}.sensor-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.sensor-grid .value{font-size:23px}.bottom{grid-column:1/-1}.details{font-size:12px;color:var(--muted);line-height:1.8;font-variant-numeric:tabular-nums}kbd{padding:2px 5px;border:1px solid #405269;background:#1c2c40;border-radius:4px;font-size:12px}.keyrow{margin-top:12px}.active{color:var(--cyan)}.small-buttons button{font-size:12px;padding:7px 9px}.record{color:var(--muted);font-size:12px}.statusline{margin-bottom:12px;font-size:13px;color:var(--amber)}:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
+@media(min-width:1500px){main{grid-template-columns:minmax(0,1fr) 390px}.map{min-height:760px}}
+@media(max-width:960px){main{grid-template-columns:1fr;padding:0 16px 20px}.map{grid-row:auto;min-height:520px}.canvas-wrap{min-height:400px}.stack{grid-template-columns:1fr 1fr}.bottom{grid-column:auto}header{padding:20px 16px}.sensor-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.stack{grid-template-columns:1fr}.map{min-height:450px}.canvas-wrap{min-height:330px}header{align-items:start}.badge{white-space:nowrap}.card{padding:16px}}
+</style>
+</head>
+<body>
+<header><div><h1>RC Controller</h1><div class="sub">Raspberry Pi 4 · 후륜 구동 · 75 mm</div></div><div id="connection" class="badge">연결 안 됨</div></header>
+<main>
+ <section class="card map">
+  <div class="map-head"><div><h2>LiDAR · 2D 스캔</h2><small>차량 중심의 실시간 거리 지도</small></div><label>표시 반경 <select id="range"><option value="2">2 m</option><option value="4" selected>4 m</option><option value="8">8 m</option><option value="12">12 m</option></select></label></div>
+  <div class="canvas-wrap"><canvas id="map" aria-label="라이다 거리 점군 지도"></canvas></div>
+  <div class="map-foot"><span id="lidarStatus">LiDAR 연결 대기</span><span id="pointCount">0 points</span></div>
+  <div class="hint">전방 0° · 오른쪽 90° · 거리 단위 m. 현재 스캔을 표시하며, 위치 추정이나 SLAM 누적 지도는 포함하지 않습니다.</div>
+ </section>
+ <div class="stack">
+  <section class="card">
+   <h2>연결 및 조종</h2>
+   <form id="login" class="row"><input id="token" type="password" aria-label="Pi 터미널 접속 키" placeholder="Pi 터미널에 표시된 접속 키" autocomplete="off" required><button type="submit">연결</button></form>
+   <p id="error" class="error" role="alert"></p>
+   <div id="blockers" class="notice">실제 Pi 서버에 연결하면 센서 상태가 표시됩니다.</div>
+   <div id="controlStatus" class="statusline">구동 비활성</div>
+   <div class="row small-buttons"><button id="arm" class="primary" disabled>구동 활성화</button><button id="stop" disabled>구동 해제</button><button id="reset" disabled>정지 잠금 해제</button></div>
+   <button id="estop" class="danger" disabled>비상정지 · Space</button>
+   <div class="keyrow"><kbd>Shift</kbd> 누른 상태에서 <kbd>W</kbd>/<kbd>S</kbd> 전후진, <kbd>A</kbd>/<kbd>D</kbd> 조향</div>
+   <p class="hint">방향키도 지원합니다. 키를 놓으면 정지합니다. 탭 전환·창 이탈·통신 지연 시 구동이 해제되며 다시 활성화해야 합니다.</p>
+  </section>
+  <section class="card">
+   <h2>속도 및 출력</h2>
+   <label for="speed" class="row space"><span>주행 목표 RPM</span><b id="speedText">20 RPM</b></label><input id="speed" type="range" min="0" max="80" value="20" step="1">
+   <label for="power" class="row space"><span>DC 모터 출력 상한</span><b id="powerText">35%</b></label><input id="power" type="range" min="0" max="35" value="35" step="1">
+   <label for="steer" class="row space"><span>키보드 최대 조향 명령</span><b id="steerText">10°</b></label><input id="steer" type="range" min="0" max="15" value="10" step="1">
+   <div class="hint">출력 막대는 PI가 사용할 수 있는 PWM 상한입니다. 실제 출력은 아래에 표시됩니다. 막대를 움직이는 것만으로는 주행하지 않습니다.</div>
+  </section>
+ </div>
+ <section class="card bottom">
+  <div class="row space"><h2>실시간 구동 데이터</h2><span id="recording" class="record">기록 상태 대기</span></div>
+  <div class="sensor-grid">
+   <div class="metric"><small>후륜 M1</small><span id="rpm0" class="value">—</span> <span class="unit">RPM</span><div id="motor0" class="details">엔코더 대기</div></div>
+   <div class="metric"><small>후륜 M2</small><span id="rpm1" class="value">—</span> <span class="unit">RPM</span><div id="motor1" class="details">엔코더 대기</div></div>
+   <div class="metric"><small>누적 이동거리 · 두 바퀴 평균</small><span id="distance" class="value">—</span> <span class="unit">m</span><div id="distanceNote" class="details">현재 실행 세션 기준</div></div>
+   <div class="metric"><small>서보 명령각 · 중심 기준</small><span id="servoAngle" class="value">—</span> <span class="unit">°</span><div id="servoDetails" class="details">실측 조향각 센서 연결 없음</div></div>
+  </div>
+ </section>
+ <section class="card bottom">
+  <h2>US-100 · 거리 수집</h2><div class="sensor-grid" id="ultrasound"></div><p class="hint">4개 센서를 순서대로 측정합니다. 응답 없는 센서는 거리 0이 아니라 ‘—’로 표시합니다. 자동 장애물 제동은 사용하지 않습니다.</p>
+ </section>
+ <section class="card bottom">
+  <div class="row space"><h2>MT6701 · A/B/Z 증분 엔코더</h2><button id="zero" disabled>현재 위치를 상대 영점으로</button></div>
+  <div class="metrics"><div><span id="mtAngle" class="value">—</span> <span class="unit">° 상대각</span><div id="mtNote" class="details">PPR 미확인 · 설정 후 각도 환산 가능</div></div><div id="mtRaw" class="details">A / B / Z 데이터 대기</div></div>
+ </section>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const client = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2,'0')).join('');
+let token = '', state = null, lease = null, sequence = 0, streamAbort = null, driveBusy = false;
+let lastReceived = 0, linked = false, keys = new Set(), limitsSet = false;
+let leaseStarted = 0;
+const fmt = (n, digits=1) => n == null ? '—' : Number(n).toFixed(digits);
+const set = (id, value) => { $(id).textContent = value; };
+for(let i=0; i<4; i++) {
+ const node=document.createElement('div'); node.className='metric';
+ node.innerHTML=`<small>초음파 ${i+1}</small><span id="us${i}" class="value">—</span> <span class="unit">cm</span><div id="usStatus${i}" class="details">대기</div>`;
+ $('ultrasound').append(node);
+}
+function fresh(){ return linked && state && performance.now()-lastReceived<400; }
+function showError(e){ set('error', e.message || String(e)); }
+async function post(op, extra={}) {
+ const abort = new AbortController(); const timer=setTimeout(()=>abort.abort(), 700);
+ try {
+  const response=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','X-RC-Token':token},body:JSON.stringify({op,client,seen:state?.monotonic,...extra}),signal:abort.signal,cache:'no-store'});
+  const result=await response.json(); if(!response.ok) throw new Error(result.error || '명령 실패'); return result;
+ } finally {clearTimeout(timer);}
+}
+function stop(emergency=false) {
+ keys.clear(); lease=null;
+ if(token) post(emergency?'estop':'stop').catch(showError);
+}
+function updateControls(){
+ const connected=fresh();
+ $('arm').disabled=!connected || state.armed || state.estop || state.fatal || state.blockers.length>0;
+ $('stop').disabled=!connected; $('estop').disabled=!connected;
+ $('reset').disabled=!connected || state.armed || state.fatal;
+ $('zero').disabled=!connected || state.armed;
+}
+function render(s){
+ state=s; lastReceived=performance.now(); linked=true;
+ set('connection', '연결됨 · TCP'); $('connection').style.color='var(--cyan)';
+ set('controlStatus',s.reason+(s.armed && s.owner!==client ? ' · 다른 탭이 조종 중' : ''));
+ const notes=s.blockers.length ? s.blockers.join('\n') : 'Shift를 누른 동안만 조종됩니다. 주변을 확인하고 구동을 활성화하세요.';
+ set('blockers',notes);
+ if(lease && !s.armed && s.monotonic>=leaseStarted) {lease=null; keys.clear();}
+ if(!limitsSet){
+  $('speed').max=s.limits.max_rpm; $('speed').value=Math.min(20,s.limits.max_rpm);
+  $('power').max=Math.floor(s.limits.max_duty*100); $('power').value=$('power').max;
+  $('steer').max=s.limits.max_angle_deg; $('steer').value=Math.min(10,s.limits.max_angle_deg);
+  limitsSet=true; sliderText();
+ }
+ s.motors.forEach((m,i)=>{
+  set(`rpm${i}`,fmt(m.rpm));
+  set(`motor${i}`,`PWM ${fmt(m.duty*100)}% · count ${m.count} · A/B ${m.a}/${m.b} · 거리 ${fmt(m.distance_m,3)} m`);
+ });
+ set('distance',fmt(s.distance_m,3));
+ set('distanceNote',s.motors.every(m=>m.calibrated)?'현재 실행 세션 · 휠 엔코더 추정':'보정 전 추정값 · counts/rev 확인 필요');
+ set('servoAngle',fmt(s.servo.command_deg));
+ set('servoDetails',`PWM ${s.servo.pulse_us} µs · 실제 바퀴 조향각은 미측정`);
+ s.ultrasonic.forEach((v,i)=>{set(`us${i}`,fmt(v.distance_m==null?null:v.distance_m*100));set(`usStatus${i}`,`${v.status} · ${v.age_s==null?'—':fmt(v.age_s,2)+'s 전'}`);});
+ const mt=s.mt6701;
+ set('mtAngle',fmt(mt.relative_deg,2));
+ set('mtNote',mt.ppr ? `PPR ${mt.ppr} · ${mt.zeroed?'수동 영점':'프로그램 시작 위치'} 기준 · 절대각 아님` : 'PPR 미확인 · config.json의 mt6701.ppr 설정 필요');
+ set('mtRaw',`count ${mt.count} · A/B ${mt.a}/${mt.b} · Z 검출 ${mt.z_count}회 · 마지막 Z count ${mt.index_count??'—'} · Z 이후 각도 ${fmt(mt.since_index_deg,2)}°`);
+ set('lidarStatus',s.lidar.status+(s.lidar.age_s==null?'':` · ${fmt(s.lidar.age_s,2)}s 전`));
+ set('pointCount',`${s.lidar.points.length} points`);
+ set('recording',s.recording.error?'기록 오류: '+s.recording.error:s.recording.enabled?'● Pi에 센서 기록 중':'기록 비활성');
+ updateControls(); draw();
+}
+async function connect(){
+ if(streamAbort) streamAbort.abort();
+ if(lease) stop();
+ token=$('token').value.trim(); $('token').value='';
+ if(!token){showError('Pi 터미널의 접속 키를 입력하세요');return;}
+ state=null; linked=false; limitsSet=false; lease=null; keys.clear();
+ set('error',''); set('connection','연결 중');
+ const abort=new AbortController(); streamAbort=abort;
+ try{
+  const response=await fetch('/api/events',{headers:{'X-RC-Token':token},signal:abort.signal,cache:'no-store'});
+  if(!response.ok){const msg=await response.json();throw new Error(msg.error);}
+  const reader=response.body.getReader(), decoder=new TextDecoder(); let buffer='';
+  while(true){
+   const {value,done}=await reader.read(); if(done) throw new Error('Pi 연결이 종료되었습니다');
+   buffer+=decoder.decode(value,{stream:true});
+   if(buffer.length>300000) throw new Error('수신 데이터가 너무 큽니다');
+   let split;
+   while((split=buffer.indexOf('\n\n'))>=0){
+    const frame=buffer.slice(0,split); buffer=buffer.slice(split+2);
+    if(frame.startsWith('data: ')) render(JSON.parse(frame.slice(6)));
+   }
+  }
+ }catch(e){
+  if(streamAbort!==abort) return;
+  linked=false; lease=null; keys.clear(); set('connection','연결 끊김'); $('connection').style.color='var(--red)';
+  if(e.name!=='AbortError') showError(e); updateControls(); draw();
+ }
+}
+async function drive(){
+ if(driveBusy || !lease || !fresh() || !document.hasFocus() || document.hidden) return;
+ const deadman=keys.has('ShiftLeft') || keys.has('ShiftRight');
+ const forward=keys.has('KeyW') || keys.has('ArrowUp'), backward=keys.has('KeyS') || keys.has('ArrowDown');
+ const left=keys.has('KeyA') || keys.has('ArrowLeft'), right=keys.has('KeyD') || keys.has('ArrowRight');
+ driveBusy=true; const sentLease=lease;
+ try{await post('drive',{lease:sentLease,seq:++sequence,deadman,rpm:(Number(forward)-Number(backward))*Number($('speed').value),steer:(Number(right)-Number(left))*Number($('steer').value),duty_limit:Number($('power').value)/100});}
+ catch(e){if(lease===sentLease){lease=null;keys.clear();showError(e);post('stop').catch(()=>{});}}
+ finally{driveBusy=false;}
+}
+function sliderText(){set('speedText',$('speed').value+' RPM');set('powerText',$('power').value+'%');set('steerText',$('steer').value+'°');}
+['speed','power','steer'].forEach(id=>$(id).addEventListener('input',sliderText));
+$('login').addEventListener('submit',e=>{e.preventDefault();connect();});
+$('arm').onclick=async()=>{keys.clear();try{const r=await post('arm');lease=r.lease;leaseStarted=r.armed_at;sequence=0;set('error','');$('arm').blur();drive();}catch(e){showError(e);}};
+$('stop').onclick=()=>stop(); $('estop').onclick=()=>stop(true);
+$('reset').onclick=()=>post('reset').catch(showError); $('zero').onclick=()=>post('zero_mt').catch(showError);
+const motionCodes=['KeyW','KeyS','KeyA','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','ShiftLeft','ShiftRight'];
+window.addEventListener('keydown',e=>{
+ if(e.code==='Space' && linked){e.preventDefault();if(!e.repeat)stop(true);return;}
+ if(e.target instanceof Element && e.target.matches('input,select,textarea,button') && !['ShiftLeft','ShiftRight'].includes(e.code)) return;
+ if(motionCodes.includes(e.code)){e.preventDefault();keys.add(e.code);drive();}
+});
+window.addEventListener('keyup',e=>{if(motionCodes.includes(e.code)){keys.delete(e.code);drive();}});
+window.addEventListener('blur',()=>{if(lease)stop();else keys.clear();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden && lease)stop();});
+window.addEventListener('pagehide',()=>{keys.clear();lease=null;if(token)fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','X-RC-Token':token},body:JSON.stringify({op:'stop'}),keepalive:true}).catch(()=>{});});
+setInterval(()=>{
+ if(linked && performance.now()-lastReceived>500){linked=false;stop();set('connection','데이터 지연 · 구동 해제');$('connection').style.color='var(--red)';updateControls();draw();}
+ drive();
+},100);
+const canvas=$('map'),ctx=canvas.getContext('2d');
+function draw(){
+ const box=canvas.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+ canvas.width=Math.round(box.width*ratio);canvas.height=Math.round(box.height*ratio);ctx.scale(ratio,ratio);
+ const w=box.width,h=box.height,cx=w/2,cy=h/2,r=Math.max(10,Math.min(w,h)/2-30),range=Number($('range').value);
+ ctx.clearRect(0,0,w,h);ctx.strokeStyle='#263a4f';ctx.lineWidth=1;ctx.fillStyle='#8199b2';ctx.font='11px system-ui';
+ for(let i=1;i<=4;i++){ctx.beginPath();ctx.arc(cx,cy,r*i/4,0,Math.PI*2);ctx.stroke();ctx.fillText(fmt(range*i/4)+' m',cx+5,cy-r*i/4+14);}
+ ctx.beginPath();ctx.moveTo(cx-r,cy);ctx.lineTo(cx+r,cy);ctx.moveTo(cx,cy-r);ctx.lineTo(cx,cy+r);ctx.stroke();
+ ctx.fillText('전방 · 0°',cx-25,cy-r-12);ctx.fillText('90°',cx+r+4,cy+4);
+ if(fresh()){
+  ctx.fillStyle='#4bd5ce';for(const [angle,distance] of state.lidar.points){if(distance>range)continue;const a=angle*Math.PI/180;ctx.fillRect(cx+Math.sin(a)*distance/range*r-1.5,cy-Math.cos(a)*distance/range*r-1.5,3,3);}
+ }
+ ctx.fillStyle='#edc26d';ctx.beginPath();ctx.moveTo(cx,cy-11);ctx.lineTo(cx-7,cy+8);ctx.lineTo(cx+7,cy+8);ctx.closePath();ctx.fill();
+ if(!fresh() || !state.lidar.points.length){ctx.fillStyle='#a6b9cc';ctx.font='14px system-ui';ctx.textAlign='center';ctx.fillText(fresh()?'유효한 LiDAR 스캔을 기다리고 있습니다':'실제 센서 연결 대기',cx,cy+45);ctx.textAlign='left';}
+}
+$('range').onchange=draw; new ResizeObserver(draw).observe(canvas.parentElement); draw();
+</script>
+</body>
+</html>
